@@ -13,9 +13,7 @@ class ClipClassifier:
     def __init__(self, model_name="ViT-B/32"):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model, self.preprocess = clip.load(model_name, device=self.device)
-        self.class_names = ["cat", "dog", "horse", "person", "car", "airplane", "chair", "bottle", 
-                           "watch", "tree", "camel", "rose", "sunflower", "elephant", "giraffe", 
-                           "kangaroo", "panda", "penguin", "tiger", "zebra"]
+        self.class_names = ["bycicle", "car", "motorcycle", "plane", "traffic light", "fire hydrant", "cat", "dog", "horse", "sheep","cow", "elephant", "zebra","giraffe"]
         self.text_prompts = [f"A sketch of a(n) {name}" for name in self.class_names]
         self.text_inputs = clip.tokenize(self.text_prompts).to(self.device)
         self.classification_results = {}
