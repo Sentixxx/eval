@@ -10,6 +10,7 @@ import argparse
 from functools import lru_cache
 import cairosvg
 import io
+import cv2
 
 # 设置设备，优先使用GPU
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -43,14 +44,34 @@ def preprocess_image(img_path):
             except Exception as svg_e:
                 print(f"SVG转换错误: {img_path}: {svg_e}")
                 return None
+        
+        # 使用cv2读取和预处理图像
+        target_size = (224, 224)
+        img = cv2.imread(img_path)
+        if img is None:
+            print(f"无法读取图片: {img_path}")
+            return None
             
-        img = Image.open(img_path)
-        # 处理透明通道
-        if img.mode == 'RGBA':
-            white_bg = Image.new("RGB", img.size, (255, 255, 255))
-            white_bg.paste(img, (0, 0), img.split()[3])
-            img = white_bg
-        return preprocess(img).to(device)
+        # 计算缩放比例，保持纵横比
+        h, w = img.shape[:2]
+        ratio = min(target_size[0] / w, target_size[1] / h)
+        new_size = (int(w * ratio), int(h * ratio))
+        img = cv2.resize(img, new_size, interpolation=cv2.INTER_AREA)
+        h, w = img.shape[:2]
+            
+        # 创建白色画布并居中放置图像
+        canvas = np.ones((target_size[1], target_size[0], 3), dtype=np.uint8) * 255
+        
+        x_offset = (target_size[0] - w) // 2
+        y_offset = (target_size[1] - h) // 2
+        
+        canvas[y_offset:y_offset+h, x_offset:x_offset+w] = img
+        
+        # 转换为PIL图像
+        img_rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(img_rgb)
+        
+        return preprocess(pil_img).to(device)
     except Exception as e:
         print(f"图像预处理错误 {img_path}: {e}")
         return None
