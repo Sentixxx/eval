@@ -95,6 +95,11 @@ def calculate_similarity_batch(img_list1, img_list2, batch_size=16):
         batch_img1 = img_list1[i:i+batch_size]
         batch_img2 = img_list2[i:i+batch_size]
         
+        # 确保两个批次长度一致
+        min_len = min(len(batch_img1), len(batch_img2))
+        batch_img1 = batch_img1[:min_len]
+        batch_img2 = batch_img2[:min_len]
+        
         # 创建批处理张量
         batch_tensor1 = []
         batch_tensor2 = []
@@ -125,8 +130,19 @@ def calculate_similarity_batch(img_list1, img_list2, batch_size=16):
         
         # 批量计算距离
         with torch.no_grad():
-            distances = model(batch_tensor1, batch_tensor2)
-            results.extend(distances.cpu().numpy())
+            try:
+                distances = model(batch_tensor1, batch_tensor2)
+                results.extend(distances.cpu().numpy())
+            except Exception as e:
+                print(f"批处理计算错误: {e}")
+                # 回退到单个图像计算
+                for j in range(len(batch_tensor1)):
+                    try:
+                        distance = model(batch_tensor1[j].unsqueeze(0), batch_tensor2[j].unsqueeze(0))
+                        results.append(distance.item())
+                    except Exception as inner_e:
+                        print(f"单图像计算错误: {inner_e}")
+                        results.append(float('inf'))
     
     return results
 
@@ -287,8 +303,17 @@ if __name__ == "__main__":
                 print(f"批处理计算失败，切换到单图像处理: {e}")
                 similarities = []
                 for i in range(len(img_batch_origin)):
-                    similarity = calculate_similarity(img_batch_origin[i], img_batch_sketch[i])
-                    similarities.append(similarity)
+                    try:
+                        similarity = calculate_similarity(img_batch_origin[i], img_batch_sketch[i])
+                        similarities.append(similarity)
+                    except Exception as single_e:
+                        print(f"单图像处理失败 ({img_batch_origin[i]} -> {img_batch_sketch[i]}): {single_e}")
+                        similarities.append(float('inf'))
+        
+        # 检查和过滤无效结果
+        if not similarities or all(s == float('inf') for s in similarities):
+            print(f"类别 {label} 中的所有相似度计算均失败")
+            continue
         
         # 计算平均相似度
         valid_similarities = [s for s in similarities if s != float('inf') and s >= args.threshold]
@@ -297,9 +322,11 @@ if __name__ == "__main__":
             similarity_results[label] = {
                 'average': avg_similarity,
                 'count': len(valid_similarities),
-                'individual': dict(zip(paths, similarities))
+                'individual': dict(zip([p for i, p in enumerate(paths) if similarities[i] != float('inf') and similarities[i] >= args.threshold], valid_similarities))
             }
             print(f"类别: {label} | 平均相似度: {avg_similarity:.4f} | 样本数: {len(valid_similarities)}")
+        else:
+            print(f"类别: {label} | 没有有效的相似度结果")
     
     # 输出总体结果
     if similarity_results:
