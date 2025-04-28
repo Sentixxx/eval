@@ -236,7 +236,7 @@ if __name__ == "__main__":
                 continue
                 
             origin_img_path = origin_images[label][true_name]
-            sketch_path = str(image_folder / img_name)
+            sketch_path = str(image_folder / label / img_name)
             
             # 验证文件存在
             if not os.path.exists(sketch_path):
