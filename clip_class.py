@@ -8,12 +8,15 @@ import numpy as np
 import cairosvg
 import io
 
+# 设置matplotlib支持中文显示
+plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'DejaVu Sans', 'Bitstream Vera Sans', 'sans-serif']
+plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
 
 class ClipClassifier:
     def __init__(self, model_name="ViT-B/32"):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model, self.preprocess = clip.load(model_name, device=self.device)
-        self.class_names = ["bycicle", "car", "motorcycle", "plane", "traffic light", "fire hydrant", "cat", "dog", "horse", "sheep","cow", "elephant", "zebra","giraffe"]
+        self.class_names = ["bicycle", "car", "motorcycle", "plane", "traffic light", "fire hydrant", "cat", "dog", "horse", "sheep","cow", "elephant", "zebra","giraffe"]
         self.text_prompts = [f"A sketch of a(n) {name}" for name in self.class_names]
         self.text_inputs = clip.tokenize(self.text_prompts).to(self.device)
         self.classification_results = {}
@@ -222,12 +225,12 @@ class ClipClassifier:
         for bar, percentage in zip(bars, percentages):
             height = bar.get_height()
             plt.text(bar.get_x() + bar.get_width()/2., height + 0.1,
-                     f'{height}个 ({percentage:.1f}%)',
+                     f'{height} ({percentage:.1f}%)',
                      ha='center', va='bottom', fontsize=9)
         
-        plt.title('图像分类结果统计')
-        plt.xlabel('类别')
-        plt.ylabel('图像数量')
+        plt.title('Classification Results Statistics')
+        plt.xlabel('Category')
+        plt.ylabel('Image Count')
         plt.xticks(rotation=45, ha='right')
         plt.tight_layout()
         
@@ -244,7 +247,7 @@ class ClipClassifier:
         plt.legend(classes, loc="best", bbox_to_anchor=(0.9, 0.1, 0.5, 0.5))
         
         plt.axis('equal')
-        plt.title('各类别图像占比')
+        plt.title('Image Category Distribution')
         plt.tight_layout()
         
         plt.savefig('classification_pie_chart.png', dpi=300)
@@ -284,9 +287,9 @@ class ClipClassifier:
         # 绘制热力图
         plt.figure(figsize=(12, 10))
         sns.heatmap(cm_df, annot=True, fmt='d', cmap='Blues')
-        plt.title('混淆矩阵')
-        plt.ylabel('真实标签')
-        plt.xlabel('预测标签')
+        plt.title('Confusion Matrix')
+        plt.ylabel('True Label')
+        plt.xlabel('Predicted Label')
         plt.tight_layout()
         
         plt.savefig('confusion_matrix.png', dpi=300)
