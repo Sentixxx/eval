@@ -18,6 +18,8 @@ class ClipClassifier:
         self.text_inputs = clip.tokenize(self.text_prompts).to(self.device)
         self.classification_results = {}
         self.confidence_scores = {}
+        self.ground_truth_labels = {}  # 存储文件的真实标签
+        self.accuracy = 0  # 存储整体准确率
         
     def convert_svg_to_png(self, svg_path):
         try:
@@ -27,7 +29,7 @@ class ClipClassifier:
             print(f"SVG转换错误 {svg_path}: {e}")
             return None
     
-    def process_image(self, img_path, temp_dir=None):
+    def process_image(self, img_path, temp_dir=None, true_label=None):
         try:
             if temp_dir:
                 png_path = temp_dir / f"{img_path.stem}.png"
@@ -80,7 +82,18 @@ class ClipClassifier:
                     self.class_names[indices[i].item()]: values[i].item() for i in range(3)
                 }
                 
-                print(f"图像: {img_path.name} | 预测类别: {top_class} | 置信度: {values[0].item():.2f}")
+                # 如果提供了真实标签，则存储它
+                if true_label:
+                    self.ground_truth_labels[img_path.name] = true_label
+                
+                correct_mark = ""
+                if true_label:
+                    is_correct = top_class == true_label
+                    correct_mark = "✓" if is_correct else "✗"
+                
+                print(f"图像: {img_path.name} | 预测类别: {top_class} | 置信度: {values[0].item():.2f} {correct_mark}")
+                if true_label and not is_correct:
+                    print(f"  真实类别: {true_label}")
                 print(f"  次要预测: {self.class_names[indices[1].item()]} ({values[1].item():.2f}), {self.class_names[indices[2].item()]} ({values[2].item():.2f})")
                 
             return True
@@ -91,20 +104,40 @@ class ClipClassifier:
     def classify_images(self, image_folder):
         # 获取所有图像文件
         image_files = []
-        for ext in ['*.svg', '*.png', '*.jpg', '*.jpeg']:
-            image_files.extend(list(Path(image_folder).glob(ext)))
+        
+        # 检查是否有子文件夹，如果有，则使用子文件夹名称作为标签
+        folder_path = Path(image_folder)
+        has_subfolders = any(item.is_dir() for item in folder_path.iterdir())
+        
+        if has_subfolders:
+            print("检测到子文件夹结构，使用文件夹名称作为真实标签...")
+            for subfolder in folder_path.iterdir():
+                if subfolder.is_dir():
+                    label = subfolder.name
+                    # 检查标签是否在我们的类别列表中
+                    if label not in self.class_names:
+                        print(f"警告: 子文件夹 '{label}' 不在预设类别列表中")
+                    
+                    for ext in ['*.svg', '*.png', '*.jpg', '*.jpeg']:
+                        for img_path in subfolder.glob(ext):
+                            image_files.append((img_path, label))
+        else:
+            # 没有子文件夹，按照原来的方式处理
+            for ext in ['*.svg', '*.png', '*.jpg', '*.jpeg']:
+                for img_path in folder_path.glob(ext):
+                    image_files.append((img_path, None))
         
         if not image_files:
             print(f"在 {image_folder} 中未找到支持的图像文件")
-            return
+            return 0
             
         # 创建临时目录
         temp_dir = Path("temp_png")
         temp_dir.mkdir(exist_ok=True)
         
         # 处理所有图像
-        for img_path in image_files:
-            self.process_image(img_path, temp_dir)
+        for img_path, true_label in image_files:
+            self.process_image(img_path, temp_dir, true_label)
         
         # 清理临时文件
         for temp_file in temp_dir.glob('*'):
@@ -119,6 +152,47 @@ class ClipClassifier:
             print(f"无法删除临时目录 {temp_dir}: {e}")
             
         return len(image_files)
+    
+    def calculate_accuracy(self):
+        """计算分类准确率"""
+        if not self.ground_truth_labels:
+            print("没有提供真实标签，无法计算准确率")
+            return 0
+            
+        correct = 0
+        total = 0
+        
+        # 按类别计算准确率
+        class_accuracy = {}
+        class_counts = {}
+        
+        for filename, true_label in self.ground_truth_labels.items():
+            predicted_label = self.classification_results.get(filename)
+            if predicted_label:
+                total += 1
+                if predicted_label == true_label:
+                    correct += 1
+                
+                # 按类别统计
+                if true_label not in class_counts:
+                    class_counts[true_label] = 0
+                    class_accuracy[true_label] = 0
+                
+                class_counts[true_label] += 1
+                if predicted_label == true_label:
+                    class_accuracy[true_label] += 1
+        
+        # 计算总体准确率
+        self.accuracy = correct / total if total > 0 else 0
+        print(f"\n总体准确率: {self.accuracy:.2%} ({correct}/{total})")
+        
+        # 按类别显示准确率
+        print("\n各类别准确率:")
+        for label, count in class_counts.items():
+            acc = class_accuracy[label] / count if count > 0 else 0
+            print(f"类别: {label} | 准确率: {acc:.2%} ({class_accuracy[label]}/{count})")
+            
+        return self.accuracy
     
     def generate_statistics(self, total_images):
         # 生成统计结果
@@ -176,7 +250,49 @@ class ClipClassifier:
         plt.savefig('classification_pie_chart.png', dpi=300)
         plt.close()
         
+        # 如果有真实标签，则绘制混淆矩阵
+        if self.ground_truth_labels:
+            self.visualize_confusion_matrix()
+        
         print(f"\n可视化结果已保存为 'classification_results.png' 和 'classification_pie_chart.png'")
+    
+    def visualize_confusion_matrix(self):
+        """绘制混淆矩阵可视化"""
+        from sklearn.metrics import confusion_matrix
+        import pandas as pd
+        import seaborn as sns
+        
+        # 获取所有唯一的类别标签
+        all_classes = sorted(list(set(self.ground_truth_labels.values())))
+        
+        # 准备真实标签和预测标签的列表
+        y_true = []
+        y_pred = []
+        
+        for filename, true_label in self.ground_truth_labels.items():
+            pred_label = self.classification_results.get(filename)
+            if pred_label:
+                y_true.append(true_label)
+                y_pred.append(pred_label)
+        
+        # 计算混淆矩阵
+        cm = confusion_matrix(y_true, y_pred, labels=all_classes)
+        
+        # 创建DataFrame以便更好地展示
+        cm_df = pd.DataFrame(cm, index=all_classes, columns=all_classes)
+        
+        # 绘制热力图
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(cm_df, annot=True, fmt='d', cmap='Blues')
+        plt.title('混淆矩阵')
+        plt.ylabel('真实标签')
+        plt.xlabel('预测标签')
+        plt.tight_layout()
+        
+        plt.savefig('confusion_matrix.png', dpi=300)
+        plt.close()
+        
+        print("混淆矩阵已保存为 'confusion_matrix.png'")
 
 
 def main():
@@ -202,6 +318,10 @@ def main():
     # 如果没有找到图像则退出
     if not total_images:
         return
+    
+    # 计算准确率（如果有真实标签）
+    if classifier.ground_truth_labels:
+        classifier.calculate_accuracy()
     
     # 生成统计数据
     class_counts = classifier.generate_statistics(total_images)
