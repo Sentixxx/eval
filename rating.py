@@ -24,7 +24,7 @@ def preprocess_image(img_path):
         return None
 
 def read_origin_images(path, allowed_extensions=('.png', '.jpg', '.jpeg')):
-    """读取原始图像，并进行更好的错误处理"""
+    """读取原始图像路径，不加载到内存中"""
     labels = {
         "bicycle": {}, "car": {}, "motorcycle": {}, "plane": {},
         "traffic light": {}, "fire hydrant": {}, "cat": {}, "dog": {},
@@ -37,7 +37,7 @@ def read_origin_images(path, allowed_extensions=('.png', '.jpg', '.jpeg')):
         print(f"警告: 路径 {path} 不存在")
         return labels
     
-    for label in tqdm(labels, desc="读取原始图像"):
+    for label in tqdm(labels, desc="读取原始图像路径"):
         label_path = path / label
         if not label_path.exists():
             print(f"警告: 标签路径 {label_path} 不存在")
@@ -46,12 +46,11 @@ def read_origin_images(path, allowed_extensions=('.png', '.jpg', '.jpeg')):
         for file in os.listdir(label_path):
             if file.lower().endswith(allowed_extensions):
                 file_name = file.split(".")[0]
-                try:
-                    img_path = label_path / file
-                    img = Image.open(img_path)
-                    labels[label][file_name] = img
-                except Exception as e:
-                    print(f"无法读取图像 {label_path / file}: {e}")
+                img_path = label_path / file
+                if img_path.exists():
+                    labels[label][file_name] = str(img_path)
+                else:
+                    print(f"警告: 图像 {img_path} 不存在")
     
     return labels
 
@@ -64,8 +63,32 @@ def calculate_similarity_batch(img_list1, img_list2, batch_size=16):
         batch_img2 = img_list2[i:i+batch_size]
         
         # 创建批处理张量
-        batch_tensor1 = torch.cat([preprocess(img).unsqueeze(0) for img in batch_img1]).to(device)
-        batch_tensor2 = torch.cat([preprocess(img).unsqueeze(0) for img in batch_img2]).to(device)
+        batch_tensor1 = []
+        batch_tensor2 = []
+        
+        for j in range(len(batch_img1)):
+            # 处理第一个列表中的图像
+            if isinstance(batch_img1[j], str):
+                processed_img1 = preprocess_image(batch_img1[j])
+            else:
+                processed_img1 = preprocess(batch_img1[j]).to(device)
+                
+            # 处理第二个列表中的图像
+            if isinstance(batch_img2[j], str):
+                processed_img2 = preprocess_image(batch_img2[j])
+            else:
+                processed_img2 = preprocess(batch_img2[j]).to(device)
+                
+            if processed_img1 is not None and processed_img2 is not None:
+                batch_tensor1.append(processed_img1.unsqueeze(0))
+                batch_tensor2.append(processed_img2.unsqueeze(0))
+        
+        if not batch_tensor1 or not batch_tensor2:
+            continue
+            
+        # 合并批处理张量
+        batch_tensor1 = torch.cat(batch_tensor1).to(device)
+        batch_tensor2 = torch.cat(batch_tensor2).to(device)
         
         # 批量计算距离
         with torch.no_grad():
@@ -77,11 +100,19 @@ def calculate_similarity_batch(img_list1, img_list2, batch_size=16):
 def calculate_similarity(img1, img2):
     """计算单对图像的相似度"""
     try:
-        # 检查图像是否已经是预处理后的张量
-        if not isinstance(img1, torch.Tensor):
+        # 检查图像是否已经是预处理后的张量或路径
+        if isinstance(img1, str):
+            img1 = preprocess_image(img1)
+        elif not isinstance(img1, torch.Tensor):
             img1 = preprocess(img1).to(device)
-        if not isinstance(img2, torch.Tensor):
+            
+        if isinstance(img2, str):
+            img2 = preprocess_image(img2)
+        elif not isinstance(img2, torch.Tensor):
             img2 = preprocess(img2).to(device)
+            
+        if img1 is None or img2 is None:
+            return float('inf')
             
         with torch.no_grad():
             distance = model(img1.unsqueeze(0) if img1.dim() == 3 else img1, 
@@ -169,16 +200,12 @@ if __name__ == "__main__":
                 print(f"警告: 找不到原始图像 {true_name} 在类别 {label} 中")
                 continue
                 
-            img = origin_images[label][true_name]
-            sketch_path = image_folder / img_name
+            origin_img_path = origin_images[label][true_name]
+            sketch_path = str(image_folder / img_name)
             
-            try:
-                sketch_img = Image.open(sketch_path)
-                img_batch_origin.append(img)
-                img_batch_sketch.append(sketch_img)
-                paths.append(img_name)
-            except Exception as e:
-                print(f"无法打开草图图像 {sketch_path}: {e}")
+            img_batch_origin.append(origin_img_path)
+            img_batch_sketch.append(sketch_path)
+            paths.append(img_name)
         
         # 如果没有可处理的图像对，则跳过
         if not img_batch_origin:

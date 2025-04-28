@@ -7,10 +7,44 @@ import matplotlib.pyplot as plt
 import numpy as np
 import cairosvg
 import io
+import gc
+import contextlib
+from functools import wraps
+import time
 
 # 设置matplotlib支持中文显示
 plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'DejaVu Sans', 'Bitstream Vera Sans', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+
+# 文件限制上下文管理器，确保文件被正确关闭
+@contextlib.contextmanager
+def managed_open(filepath, mode='r'):
+    try:
+        f = open(filepath, mode)
+        yield f
+    finally:
+        f.close()
+
+# 添加重试装饰器处理暂时性错误
+def retry_on_exception(max_retries=3, delay=1):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            retries = 0
+            while retries < max_retries:
+                try:
+                    return func(*args, **kwargs)
+                except (IOError, OSError) as e:
+                    if "Too many open files" in str(e) and retries < max_retries - 1:
+                        retries += 1
+                        print(f"文件资源不足，等待 {delay} 秒后重试 ({retries}/{max_retries-1})...")
+                        time.sleep(delay)
+                        # 主动释放资源
+                        gc.collect()
+                    else:
+                        raise
+        return wrapper
+    return decorator
 
 class ClipClassifier:
     def __init__(self, model_name="ViT-B/32"):
@@ -40,49 +74,70 @@ class ClipClassifier:
             "giraffe": []
         }
         self.error_images = []
+        self.batch_size = 16  # 批处理大小，减少同时打开的文件数量
         
+    @retry_on_exception(max_retries=5, delay=2)
     def convert_svg_to_png(self, svg_path):
+        """使用资源管理确保文件被关闭"""
         try:
-            png_data = cairosvg.svg2png(url=str(svg_path), background_color="white")
+            # 读取SVG文件内容，而不是直接传递URL
+            with managed_open(svg_path, 'rb') as f:
+                svg_data = f.read()
+                
+            # 将SVG转换为PNG
+            png_data = cairosvg.svg2png(bytestring=svg_data, background_color="white")
             return Image.open(io.BytesIO(png_data))
         except Exception as e:
             print(f"SVG转换错误 {svg_path}: {e}")
-            return None
+            
+            # 如果出现问题，尝试替代方法
+            try:
+                with managed_open(svg_path, 'rb') as f:
+                    svg_data = f.read()
+                    
+                # 尝试不带背景色转换
+                png_data = cairosvg.svg2png(bytestring=svg_data)
+                svg_image = Image.open(io.BytesIO(png_data))
+                
+                # 创建白色背景
+                white_bg = Image.new("RGB", svg_image.size, (255, 255, 255))
+                
+                if svg_image.mode == 'RGBA':
+                    white_bg.paste(svg_image, (0, 0), svg_image.split()[3])
+                else:
+                    white_bg.paste(svg_image, (0, 0))
+                
+                return white_bg
+            except Exception as e:
+                print(f"无法处理SVG文件 {svg_path}: {e}")
+                return None
     
+    @retry_on_exception(max_retries=3, delay=1)
     def process_image(self, img_path, temp_dir=None, true_label=None):
+        """处理单个图像，添加错误重试和资源管理"""
         try:
             if temp_dir:
                 png_path = temp_dir / f"{img_path.stem}.png"
             
+            # 根据图像类型处理
             if img_path.suffix.lower() == '.svg':
-                try:
-                    png_data = cairosvg.svg2png(url=str(img_path), background_color="white")
-                    image = Image.open(io.BytesIO(png_data))
-                except Exception as svg_error:
-                    print(f"SVG转换错误 {img_path}: {svg_error}")
-                    try:
-                        png_data = cairosvg.svg2png(url=str(img_path))
-                        svg_image = Image.open(io.BytesIO(png_data))
-                        
-                        white_bg = Image.new("RGB", svg_image.size, (255, 255, 255))
-                        
-                        if svg_image.mode == 'RGBA':
-                            white_bg.paste(svg_image, (0, 0), svg_image.split()[3])
-                        else:
-                            white_bg.paste(svg_image, (0, 0))
-                        
-                        image = white_bg
-                    except Exception as e:
-                        print(f"无法处理SVG文件 {img_path}: {e}")
-                        return False
+                image = self.convert_svg_to_png(img_path)
+                if image is None:
+                    return False
             else:
-                image = Image.open(img_path)
+                # 使用上下文管理器打开图像
+                with managed_open(img_path, 'rb') as f:
+                    image = Image.open(io.BytesIO(f.read()))
+                    # 立即复制图像数据，这样可以关闭文件
+                    image = image.copy()
                 
+            # 处理透明通道
             if image.mode == 'RGBA':
                 white_bg = Image.new("RGB", image.size, (255, 255, 255))
                 white_bg.paste(image, (0, 0), image.split()[3])
                 image = white_bg
             
+            # 预处理并分类图像
             image_input = self.preprocess(image).unsqueeze(0).to(self.device)
             
             with torch.no_grad():
@@ -106,7 +161,6 @@ class ClipClassifier:
                 if true_label:
                     self.ground_truth_labels[img_path.name] = true_label
                 
-                
                 correct_mark = ""
                 if true_label:
                     is_correct = top_class == true_label
@@ -121,12 +175,17 @@ class ClipClassifier:
                     print(f"  真实类别: {true_label}")
                 print(f"  次要预测: {self.class_names[indices[1].item()]} ({values[1].item():.2f}), {self.class_names[indices[2].item()]} ({values[2].item():.2f})")
                 
+            # 释放不需要的资源
+            del image_input, image_features, text_features, similarity
+            torch.cuda.empty_cache() if torch.cuda.is_available() else gc.collect()
+            
             return True
         except Exception as e:
             print(f"处理图像 {img_path} 时出错: {e}")
             return False
     
     def classify_images(self, image_folder):
+        """分类图像，使用批处理减少同时打开的文件数量"""
         # 获取所有图像文件
         image_files = []
         
@@ -144,13 +203,11 @@ class ClipClassifier:
                         print(f"警告: 子文件夹 '{label}' 不在预设类别列表中")
                     
                     for ext in ['*.svg', '*.png', '*.jpg', '*.jpeg']:
-                        for img_path in subfolder.glob(ext):
-                            image_files.append((img_path, label))
+                        image_files.extend([(img_path, label) for img_path in subfolder.glob(ext)])
         else:
             # 没有子文件夹，按照原来的方式处理
             for ext in ['*.svg', '*.png', '*.jpg', '*.jpeg']:
-                for img_path in folder_path.glob(ext):
-                    image_files.append((img_path, None))
+                image_files.extend([(img_path, None) for img_path in folder_path.glob(ext)])
         
         if not image_files:
             print(f"在 {image_folder} 中未找到支持的图像文件")
@@ -160,9 +217,22 @@ class ClipClassifier:
         temp_dir = Path("temp_png")
         temp_dir.mkdir(exist_ok=True)
         
-        # 处理所有图像
-        for img_path, true_label in image_files:
-            self.process_image(img_path, temp_dir, true_label)
+        # 批量处理图像以减少同时打开的文件数
+        total_processed = 0
+        batch_size = self.batch_size
+        
+        for i in range(0, len(image_files), batch_size):
+            batch = image_files[i:i+batch_size]
+            print(f"处理批次 {i//batch_size + 1}/{(len(image_files)-1)//batch_size + 1} ({len(batch)} 个文件)")
+            
+            for img_path, true_label in batch:
+                success = self.process_image(img_path, temp_dir, true_label)
+                if success:
+                    total_processed += 1
+                
+                # 主动执行垃圾回收释放资源
+                if total_processed % 10 == 0:
+                    gc.collect()
         
         # 清理临时文件
         for temp_file in temp_dir.glob('*'):
@@ -176,7 +246,7 @@ class ClipClassifier:
         except Exception as e:
             print(f"无法删除临时目录 {temp_dir}: {e}")
             
-        return len(image_files)
+        return total_processed
     
     def calculate_accuracy(self):
         """计算分类准确率"""
@@ -222,7 +292,7 @@ class ClipClassifier:
     def save_error_images(self):
         if self.error_images:
             txt_path = Path("error_images.txt")
-            with open(txt_path, "w") as f:
+            with managed_open(txt_path, "w") as f:
                 for img_path in self.error_images:
                     f.write(f"{img_path}\n")
     
@@ -241,90 +311,152 @@ class ClipClassifier:
             
         return class_counts
     
+    @retry_on_exception(max_retries=3, delay=2)
     def visualize_results(self, class_counts, total_images):
-        # 创建可视化
-        classes = list(class_counts.keys())
-        counts = list(class_counts.values())
-        percentages = [count / total_images * 100 for count in counts]
+        # 创建可视化前清理资源
+        plt.close('all')
+        gc.collect()
         
-        # 条形图
-        plt.figure(figsize=(12, 6))
-        bars = plt.bar(classes, counts, color='skyblue')
+        try:
+            # 创建可视化
+            classes = list(class_counts.keys())
+            counts = list(class_counts.values())
+            percentages = [count / total_images * 100 for count in counts]
+            
+            # 条形图
+            plt.figure(figsize=(12, 6))
+            bars = plt.bar(classes, counts, color='skyblue')
+            plt.xlabel('类别')
+            plt.ylabel('图像数量')
+            plt.title('各类别图像分布')
+            plt.xticks(rotation=45, ha='right')
+            
+            # 添加数值标签
+            for i, bar in enumerate(bars):
+                plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
+                         f"{counts[i]} ({percentages[i]:.1f}%)",
+                         ha='center', va='bottom', fontsize=9)
+            
+            plt.tight_layout()
+            plt.savefig("class_distribution.png")
+            plt.close()
+            
+            # 饼图
+            plt.figure(figsize=(10, 10))
+            plt.pie(counts, labels=classes, autopct='%1.1f%%', startangle=90, 
+                    shadow=True, wedgeprops={'edgecolor': 'w'})
+            plt.title('各类别图像比例')
+            plt.axis('equal')
+            plt.tight_layout()
+            plt.savefig("class_pie.png")
+            plt.close()
+            
+            # 如果有准确率数据，绘制准确率图
+            if hasattr(self, 'accuracy') and self.ground_truth_labels:
+                class_accuracy = {}
+                class_counts = {}
+                
+                for filename, true_label in self.ground_truth_labels.items():
+                    predicted_label = self.classification_results.get(filename)
+                    if predicted_label:
+                        if true_label not in class_counts:
+                            class_counts[true_label] = 0
+                            class_accuracy[true_label] = 0
+                        
+                        class_counts[true_label] += 1
+                        if predicted_label == true_label:
+                            class_accuracy[true_label] += 1
+                
+                # 计算每个类别的准确率
+                acc_labels = []
+                acc_values = []
+                
+                for label, count in class_counts.items():
+                    if count > 0:
+                        acc = class_accuracy[label] / count
+                        acc_labels.append(label)
+                        acc_values.append(acc * 100)  # 转换为百分比
+                
+                if acc_labels:
+                    plt.figure(figsize=(12, 6))
+                    bars = plt.bar(acc_labels, acc_values, color='lightgreen')
+                    plt.xlabel('类别')
+                    plt.ylabel('准确率 (%)')
+                    plt.title('各类别分类准确率')
+                    plt.xticks(rotation=45, ha='right')
+                    plt.ylim(0, 100)
+                    
+                    # 添加数值标签
+                    for i, bar in enumerate(bars):
+                        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                                f"{acc_values[i]:.1f}%",
+                                ha='center', va='bottom', fontsize=9)
+                    
+                    plt.tight_layout()
+                    plt.savefig("class_accuracy.png")
+                    plt.close()
+            
+            print("\n可视化图表已保存为PNG文件")
         
-        for bar, percentage in zip(bars, percentages):
-            height = bar.get_height()
-            plt.text(bar.get_x() + bar.get_width()/2., height + 0.1,
-                     f'{height} ({percentage:.1f}%)',
-                     ha='center', va='bottom', fontsize=9)
-        
-        plt.title('Classification Results Statistics')
-        plt.xlabel('Category')
-        plt.ylabel('Image Count')
-        plt.xticks(rotation=45, ha='right')
-        plt.tight_layout()
-        
-        plt.savefig('classification_results.png')
-        plt.close()
-        
-        # 饼图
-        plt.figure(figsize=(12, 10))
-        plt.pie(counts, labels=classes, autopct='%1.1f%%', startangle=90, shadow=True, 
-                labeldistance=1.1,
-                pctdistance=0.85,   
-                textprops={'fontsize': 10})
-        
-        plt.legend(classes, loc="best", bbox_to_anchor=(0.9, 0.1, 0.5, 0.5))
-        
-        plt.axis('equal')
-        plt.title('Image Category Distribution')
-        plt.tight_layout()
-        
-        plt.savefig('classification_pie_chart.png', dpi=300)
-        plt.close()
-        
-        # 如果有真实标签，则绘制混淆矩阵
-        if self.ground_truth_labels:
-            self.visualize_confusion_matrix()
-        
-        print(f"\n可视化结果已保存为 'classification_results.png' 和 'classification_pie_chart.png'")
+        except Exception as e:
+            print(f"创建可视化时出错: {e}")
     
     def visualize_confusion_matrix(self):
-        """绘制混淆矩阵可视化"""
-        from sklearn.metrics import confusion_matrix
-        import pandas as pd
-        import seaborn as sns
+        """生成混淆矩阵的可视化"""
+        if not self.ground_truth_labels:
+            print("没有提供真实标签，无法创建混淆矩阵")
+            return
         
-        # 获取所有唯一的类别标签
-        all_classes = sorted(list(set(self.ground_truth_labels.values())))
+        # 清理资源
+        plt.close('all')
+        gc.collect()
         
-        # 准备真实标签和预测标签的列表
-        y_true = []
-        y_pred = []
-        
-        for filename, true_label in self.ground_truth_labels.items():
-            pred_label = self.classification_results.get(filename)
-            if pred_label:
-                y_true.append(true_label)
-                y_pred.append(pred_label)
-        
-        # 计算混淆矩阵
-        cm = confusion_matrix(y_true, y_pred, labels=all_classes)
-        
-        # 创建DataFrame以便更好地展示
-        cm_df = pd.DataFrame(cm, index=all_classes, columns=all_classes)
-        
-        # 绘制热力图
-        plt.figure(figsize=(12, 10))
-        sns.heatmap(cm_df, annot=True, fmt='d', cmap='Blues')
-        plt.title('Confusion Matrix')
-        plt.ylabel('True Label')
-        plt.xlabel('Predicted Label')
-        plt.tight_layout()
-        
-        plt.savefig('confusion_matrix.png', dpi=300)
-        plt.close()
-        
-        print("混淆矩阵已保存为 'confusion_matrix.png'")
+        try:
+            # 获取所有出现在标签中的类别
+            all_classes = sorted(list(set(self.ground_truth_labels.values())))
+            n_classes = len(all_classes)
+            
+            # 创建混淆矩阵
+            confusion_matrix = np.zeros((n_classes, n_classes), dtype=int)
+            class_to_idx = {cls: i for i, cls in enumerate(all_classes)}
+            
+            for filename, true_label in self.ground_truth_labels.items():
+                predicted_label = self.classification_results.get(filename)
+                if predicted_label:
+                    true_idx = class_to_idx[true_label]
+                    pred_idx = class_to_idx.get(predicted_label, -1)
+                    if pred_idx >= 0:
+                        confusion_matrix[true_idx, pred_idx] += 1
+            
+            # 绘制混淆矩阵
+            plt.figure(figsize=(10, 8))
+            plt.imshow(confusion_matrix, interpolation='nearest', cmap=plt.cm.Blues)
+            plt.title('混淆矩阵')
+            plt.colorbar()
+            
+            # 设置轴标签
+            tick_marks = np.arange(n_classes)
+            plt.xticks(tick_marks, all_classes, rotation=45, ha='right')
+            plt.yticks(tick_marks, all_classes)
+            
+            # 添加文本标注
+            thresh = confusion_matrix.max() / 2.0
+            for i in range(n_classes):
+                for j in range(n_classes):
+                    plt.text(j, i, format(confusion_matrix[i, j], 'd'),
+                             ha="center", va="center",
+                             color="white" if confusion_matrix[i, j] > thresh else "black")
+            
+            plt.tight_layout()
+            plt.ylabel('真实标签')
+            plt.xlabel('预测标签')
+            plt.savefig("confusion_matrix.png")
+            plt.close()
+            
+            print("\n混淆矩阵已保存为 confusion_matrix.png")
+            
+        except Exception as e:
+            print(f"创建混淆矩阵时出错: {e}")
 
 
 def main():
@@ -347,19 +479,26 @@ def main():
     # 分类图像
     total_images = classifier.classify_images(image_folder)
     
-    # 如果没有找到图像则退出
-    if not total_images:
+    # 如果没有图像则退出
+    if total_images == 0:
+        print("未找到图像，程序退出")
         return
     
     # 计算准确率（如果有真实标签）
     if classifier.ground_truth_labels:
         classifier.calculate_accuracy()
+        classifier.visualize_confusion_matrix()
     
     # 生成统计数据
     class_counts = classifier.generate_statistics(total_images)
     
     # 可视化结果
     classifier.visualize_results(class_counts, total_images)
+    
+    # 保存错误分类的图像列表
+    if classifier.error_images:
+        classifier.save_error_images()
+        print(f"已将 {len(classifier.error_images)} 个错误分类的图像路径保存到 error_images.txt")
 
 
 if __name__ == "__main__":
