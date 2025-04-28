@@ -164,6 +164,16 @@ def parse_arguments():
                         help='原始图像文件夹路径')
     parser.add_argument('--batch_size', type=int, default=16,
                         help='批处理大小')
+    parser.add_argument('--no_prompt', action='store_true',
+                        help='不显示交互式提示，直接使用命令行参数')
+    parser.add_argument('--output_file', type=str, default='',
+                        help='将结果输出到指定文件')
+    parser.add_argument('--skip_visualization', action='store_true',
+                        help='跳过结果可视化')
+    parser.add_argument('--allowed_extensions', type=str, default='.png,.jpg,.jpeg,.svg',
+                        help='允许的文件扩展名，用逗号分隔')
+    parser.add_argument('--threshold', type=float, default=0.0,
+                        help='相似度阈值，低于此值的结果将被过滤')
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -173,23 +183,37 @@ if __name__ == "__main__":
     # 初始化分类器
     classifier = clip_class.ClipClassifier()
     
+    # 处理允许的文件扩展名
+    allowed_extensions = tuple(args.allowed_extensions.split(','))
+    
     # 设置图像文件夹路径
-    image_folder = input(f"请输入图像文件夹路径 (默认为'{args.image_folder}'): ") or args.image_folder
-    image_folder = Path(image_folder)
+    if args.no_prompt:
+        image_folder = Path(args.image_folder)
+    else:
+        image_folder = input(f"请输入图像文件夹路径 (默认为'{args.image_folder}'): ") or args.image_folder
+        image_folder = Path(image_folder)
     
     # 确保文件夹存在
     if not image_folder.exists():
-        print(f"文件夹 {image_folder} 不存在，是否创建? (y/n)")
-        if input().lower() == 'y':
+        if args.no_prompt:
+            print(f"文件夹 {image_folder} 不存在，将自动创建")
             image_folder.mkdir(parents=True, exist_ok=True)
         else:
-            print("程序已退出")
-            exit()
+            print(f"文件夹 {image_folder} 不存在，是否创建? (y/n)")
+            if input().lower() == 'y':
+                image_folder.mkdir(parents=True, exist_ok=True)
+            else:
+                print("程序已退出")
+                exit()
     
     # 读取原始图像
-    origin_folder = input(f"请输入原始图像文件夹路径 (默认为'{args.origin_folder}'): ") or args.origin_folder
+    if args.no_prompt:
+        origin_folder = args.origin_folder
+    else:
+        origin_folder = input(f"请输入原始图像文件夹路径 (默认为'{args.origin_folder}'): ") or args.origin_folder
+    
     print(f"正在读取原始图像从 {origin_folder}...")
-    origin_images = read_origin_images(origin_folder)
+    origin_images = read_origin_images(origin_folder, allowed_extensions)
     
     # 分类图像
     print("开始分类图像...")
@@ -208,7 +232,8 @@ if __name__ == "__main__":
     class_counts = classifier.generate_statistics(total_images)
     
     # 可视化结果
-    classifier.visualize_results(class_counts, total_images)
+    if not args.skip_visualization:
+        classifier.visualize_results(class_counts, total_images)
 
     # 计算相似度
     print("\n计算每个类别的相似度:")
@@ -266,7 +291,7 @@ if __name__ == "__main__":
                     similarities.append(similarity)
         
         # 计算平均相似度
-        valid_similarities = [s for s in similarities if s != float('inf')]
+        valid_similarities = [s for s in similarities if s != float('inf') and s >= args.threshold]
         if valid_similarities:
             avg_similarity = sum(valid_similarities) / len(valid_similarities)
             similarity_results[label] = {
@@ -286,6 +311,17 @@ if __name__ == "__main__":
         print("\n各类别相似度排名:")
         for i, (label, data) in enumerate(sorted_results, 1):
             print(f"{i}. {label}: {data['average']:.4f} ({data['count']} 样本)")
+        
+        # 如果指定了输出文件，将结果写入文件
+        if args.output_file:
+            import json
+            with open(args.output_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'total_average': total_avg,
+                    'results': {k: {'average': v['average'], 'count': v['count']} 
+                              for k, v in similarity_results.items()}
+                }, f, ensure_ascii=False, indent=4)
+            print(f"\n结果已保存到: {args.output_file}")
     else:
         print("\n没有计算出有效的相似度结果")
 
