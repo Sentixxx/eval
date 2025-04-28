@@ -8,8 +8,6 @@ import numpy as np
 from tqdm import tqdm
 import argparse
 from functools import lru_cache
-import cairosvg
-import io
 import cv2
 
 # 设置设备，优先使用GPU
