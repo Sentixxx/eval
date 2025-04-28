@@ -1,4 +1,4 @@
-from dreamsim import dreamsim
+import dreamsim 
 from PIL import Image
 import os
 import clip_class
