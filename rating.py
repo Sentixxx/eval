@@ -8,6 +8,8 @@ import numpy as np
 from tqdm import tqdm
 import argparse
 from functools import lru_cache
+import cairosvg
+import io
 
 # 设置设备，优先使用GPU
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -17,13 +19,43 @@ model, preprocess = dreamsim(pretrained=True, device=device)
 @lru_cache(maxsize=100)
 def preprocess_image(img_path):
     try:
+        # 检查文件是否存在
+        if not os.path.exists(img_path):
+            print(f"图像不存在: {img_path}")
+            return None
+            
+        # 检查文件扩展名
+        ext = os.path.splitext(img_path)[1].lower()
+        if ext == '.svg':
+            # 使用clip_class中的转换方法处理SVG文件
+            try:
+                # 初始化分类器（如果尚未初始化）
+                if not hasattr(preprocess_image, 'classifier'):
+                    preprocess_image.classifier = clip_class.ClipClassifier()
+                
+                # 转换SVG为PNG
+                img = preprocess_image.classifier.convert_svg_to_png(img_path)
+                if img is not None:
+                    return preprocess(img).to(device)
+                else:
+                    print(f"无法转换SVG文件: {img_path}")
+                    return None
+            except Exception as svg_e:
+                print(f"SVG转换错误: {img_path}: {svg_e}")
+                return None
+            
         img = Image.open(img_path)
+        # 处理透明通道
+        if img.mode == 'RGBA':
+            white_bg = Image.new("RGB", img.size, (255, 255, 255))
+            white_bg.paste(img, (0, 0), img.split()[3])
+            img = white_bg
         return preprocess(img).to(device)
     except Exception as e:
         print(f"图像预处理错误 {img_path}: {e}")
         return None
 
-def read_origin_images(path, allowed_extensions=('.png', '.jpg', '.jpeg')):
+def read_origin_images(path, allowed_extensions=('.png', '.jpg', '.jpeg', '.svg')):
     """读取原始图像路径，不加载到内存中"""
     labels = {
         "bicycle": {}, "car": {}, "motorcycle": {}, "plane": {},
@@ -44,6 +76,7 @@ def read_origin_images(path, allowed_extensions=('.png', '.jpg', '.jpeg')):
             continue
             
         for file in os.listdir(label_path):
+            # 只处理允许的文件扩展名
             if file.lower().endswith(allowed_extensions):
                 file_name = file.split(".")[0]
                 img_path = label_path / file
@@ -194,6 +227,8 @@ if __name__ == "__main__":
         for img_path in classifier.true_label[label]:
             img_path = Path(img_path)
             img_name = img_path.name
+            
+            # 获取文件名，无论文件扩展名是什么
             true_name = img_name.split("_")[0]
             
             if true_name not in origin_images.get(label, {}):
@@ -203,6 +238,11 @@ if __name__ == "__main__":
             origin_img_path = origin_images[label][true_name]
             sketch_path = str(image_folder / img_name)
             
+            # 验证文件存在
+            if not os.path.exists(sketch_path):
+                print(f"警告: 草图文件不存在: {sketch_path}")
+                continue
+                
             img_batch_origin.append(origin_img_path)
             img_batch_sketch.append(sketch_path)
             paths.append(img_name)
