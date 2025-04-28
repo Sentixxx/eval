@@ -23,6 +23,23 @@ class ClipClassifier:
         self.confidence_scores = {}
         self.ground_truth_labels = {}  # 存储文件的真实标签
         self.accuracy = 0  # 存储整体准确率
+        self.true_label = {
+            "bicycle": [],
+            "car": [],
+            "motorcycle": [],
+            "plane": [],
+            "traffic light": [],
+            "fire hydrant": [],
+            "cat": [],
+            "dog": [],
+            "horse": [],
+            "sheep": [],
+            "cow": [],
+            "elephant": [],
+            "zebra": [],
+            "giraffe": []
+        }
+        self.error_images = []
         
     def convert_svg_to_png(self, svg_path):
         try:
@@ -89,10 +106,15 @@ class ClipClassifier:
                 if true_label:
                     self.ground_truth_labels[img_path.name] = true_label
                 
+                
                 correct_mark = ""
                 if true_label:
                     is_correct = top_class == true_label
                     correct_mark = "✓" if is_correct else "✗"
+                    if is_correct:
+                        self.true_label[true_label].append(str(img_path))
+                    else:
+                        self.error_images.append(str(img_path))
                 
                 print(f"图像: {img_path.name} | 预测类别: {top_class} | 置信度: {values[0].item():.2f} {correct_mark}")
                 if true_label and not is_correct:
@@ -196,6 +218,13 @@ class ClipClassifier:
             print(f"类别: {label} | 准确率: {acc:.2%} ({class_accuracy[label]}/{count})")
             
         return self.accuracy
+    
+    def save_error_images(self):
+        if self.error_images:
+            txt_path = Path("error_images.txt")
+            with open(txt_path, "w") as f:
+                for img_path in self.error_images:
+                    f.write(f"{img_path}\n")
     
     def generate_statistics(self, total_images):
         # 生成统计结果
